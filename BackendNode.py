@@ -9,6 +9,7 @@ that peer's log so a node returning from downtime can catch up.
 """
 
 import argparse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -74,9 +75,12 @@ class StorageNode:
             raise ValueError("message read field must be a boolean")
         if "deleted" in message and not isinstance(message["deleted"], bool):
             raise ValueError("message deleted field must be a boolean")
-        rv = message.get("rv", 0)
-        if isinstance(rv, bool) or not isinstance(rv, int):
-            raise ValueError("message rv field must be an integer")
+        vv = message.get("vv", {})
+        if not isinstance(vv, dict) or any(
+            not isinstance(site, str) or isinstance(count, bool) or not isinstance(count, int)
+            for site, count in vv.items()
+        ):
+            raise ValueError("message vv field must map site names to integers")
 
     @staticmethod
     def _merge(existing, incoming):
@@ -89,15 +93,29 @@ class StorageNode:
         merged = dict(existing)
         if incoming["deleted"]:
             merged["deleted"] = True
-        if (incoming["rv"], incoming["read"]) > (existing["rv"], existing["read"]):
-            merged["rv"] = incoming["rv"]
+        old, new = existing["vv"], incoming["vv"]
+        sites = set(old) | set(new)
+        newer = any(new.get(site, 0) > old.get(site, 0) for site in sites)
+        older = any(old.get(site, 0) > new.get(site, 0) for site in sites)
+        if newer and not older:
+            merged["vv"] = dict(new)
             merged["read"] = incoming["read"]
+        elif newer:
+            merged["vv"] = {site: max(old.get(site, 0), new.get(site, 0)) for site in sites}
+            merged["read"] = existing["read"] or incoming["read"]
+            log(f"concurrent read id={existing['id']} "
+                f"a={{read={existing['read']}, vv={old}}} "
+                f"b={{read={incoming['read']}, vv={new}}} "
+                f"rule=read-true-wins "
+                f"-> {{read={merged['read']}, vv={merged['vv']}}}")
+        elif not older and existing["read"] != incoming["read"]:
+            merged["read"] = existing["read"] or incoming["read"]
         return merged
 
     def _apply_message(self, message, persist=True):
         message = dict(message)
         message.setdefault("read", False)
-        message.setdefault("rv", 0)
+        message.setdefault("vv", {})
         message.setdefault("deleted", False)
         existing = self.messages.get(message["id"])
         if existing is not None:
@@ -124,13 +142,14 @@ class StorageNode:
         with self.lock:
             return self._apply_message(message)
 
-    def set_read(self, user, message_id, read):
+    def set_read(self, user, message_id, read, site):
         with self.lock:
             message = self.messages.get(message_id)
             if message is None or message["deleted"] or message["to"] != user:
                 return None
-            rv = max(int(time.time() * 1000), message["rv"] + 1)
-            self._apply_message(dict(message, read=read, rv=rv))
+            vv = dict(message["vv"])
+            vv[site] = vv.get(site, 0) + 1
+            self._apply_message(dict(message, read=read, vv=vv))
             return dict(message)
 
     def delete_message(self, user, message_id):
@@ -280,8 +299,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self.send(404, {"error": "unknown path"})
             if not isinstance(body.get("read"), bool):
                 raise ValueError('body must contain "read": true or "read": false')
+            site = body.get("site")
+            if not isinstance(site, str) or not site:
+                raise ValueError('body must contain a "site" name')
             user, message_id = mailbox
-            message = self.node.set_read(user, message_id, body["read"])
+            message = self.node.set_read(user, message_id, body["read"], site)
             if message is None:
                 return self.send(404, {"error": "no such message", "id": message_id})
             return self.send(200, {key: message[key] for key in ("id", "from", "subject", "read")})
@@ -309,15 +331,29 @@ def peer_address(value, default_port):
     return f"http://{parsed.hostname}:{port}"
 
 
+def log(message):
+    print(datetime.now().strftime("%H:%M:%S.%f")[:-3], message, flush=True)
+
+
 def sync_peer(node, peer_url, interval, stop_event):
+    started = time.time()
     while not stop_event.is_set():
+        previous = node.peer_reachable
         try:
             result = http_get(f"{peer_url}/replication")
-            node.import_messages(result.get("messages"))
+            imported = node.import_messages(result.get("messages"))
             node.peer_reachable = True
+            if previous is None:
+                log(f"first sync with {peer_url} done {(time.time() - started) * 1000:.0f}ms after start, "
+                    f"{imported} changes imported")
+            elif previous is False:
+                log(f"peer {peer_url} reachable again, {imported} changes imported")
+            elif imported:
+                log(f"imported {imported} changes from {peer_url}")
         except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as error:
             node.peer_reachable = False
-            print(f"peer sync with {peer_url} failed: {error}", flush=True)
+            if previous is not False:
+                log(f"peer sync with {peer_url} failed: {error}")
         stop_event.wait(interval)
 
 
