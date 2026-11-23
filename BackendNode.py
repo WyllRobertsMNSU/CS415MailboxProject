@@ -1,9 +1,11 @@
 """Persistent mailbox storage for a site's front end.
 
 The front end stores a message with POST /mail and reads mail with
-GET /mailbox/<user> or GET /mailbox/<user>/<id>. Each backend keeps its own
-append-only log. When configured with a peer, it pulls that peer's log so a
-node returning from downtime can catch up.
+GET /mailbox/<user> or GET /mailbox/<user>/<id>. PUT /mailbox/<user>/<id>
+sets the read flag and DELETE /mailbox/<user>/<id> removes a message. Each
+backend keeps its own append-only log. When configured with a peer, it pulls
+that peer's log so a node returning from downtime can catch up.
+
 """
 
 import argparse
@@ -12,6 +14,7 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,23 +33,33 @@ class StorageNode:
         self.messages = {}
         self.log = []
         self.lock = threading.RLock()
+        self.peer_reachable = None
         self._load()
 
     def _load(self):
         if not self.data_file.exists():
             return
-        with self.data_file.open("r", encoding="utf-8") as data:
-            for line_number, line in enumerate(data, start=1):
-                if not line.strip():
-                    continue
+        raw = self.data_file.read_bytes()
+        offset = 0
+        for line_number, line in enumerate(raw.splitlines(keepends=True), start=1):
+            if line.strip():
                 try:
                     message = json.loads(line)
                     self._validate_message(message)
                     self._apply_message(message, persist=False)
                 except (json.JSONDecodeError, ValueError) as error:
+                    if not line.endswith(b"\n") and offset + len(line) == len(raw):
+                        # A crash left a partial last line; drop it.
+                        print(f"dropping partial last entry of {self.data_file}", flush=True)
+                        self.data_file.write_bytes(raw[:offset])
+                        return
                     raise ValueError(
                         f"invalid mailbox log entry at {self.data_file}:{line_number}: {error}"
                     ) from error
+            offset += len(line)
+        if raw and not raw.endswith(b"\n"):
+            with self.data_file.open("ab") as data:
+                data.write(b"\n")
 
     @staticmethod
     def _validate_message(message):
@@ -59,15 +72,38 @@ class StorageNode:
             raise ValueError("message id and recipient must be valid non-empty values")
         if "read" in message and not isinstance(message["read"], bool):
             raise ValueError("message read field must be a boolean")
+        if "deleted" in message and not isinstance(message["deleted"], bool):
+            raise ValueError("message deleted field must be a boolean")
+        rv = message.get("rv", 0)
+        if isinstance(rv, bool) or not isinstance(rv, int):
+            raise ValueError("message rv field must be an integer")
+
+    @staticmethod
+    def _merge(existing, incoming):
+        if existing["to"] != incoming["to"]:
+            raise ValueError(f"message id {incoming['id']!r} has conflicting contents")
+        if not existing["deleted"] and not incoming["deleted"]:
+            for field in ("from", "subject", "body"):
+                if existing[field] != incoming[field]:
+                    raise ValueError(f"message id {incoming['id']!r} has conflicting contents")
+        merged = dict(existing)
+        if incoming["deleted"]:
+            merged["deleted"] = True
+        if (incoming["rv"], incoming["read"]) > (existing["rv"], existing["read"]):
+            merged["rv"] = incoming["rv"]
+            merged["read"] = incoming["read"]
+        return merged
 
     def _apply_message(self, message, persist=True):
         message = dict(message)
         message.setdefault("read", False)
+        message.setdefault("rv", 0)
+        message.setdefault("deleted", False)
         existing = self.messages.get(message["id"])
         if existing is not None:
-            if existing != message:
-                raise ValueError(f"message id {message['id']!r} has conflicting contents")
-            return False
+            message = self._merge(existing, message)
+            if message == existing:
+                return False
 
         if persist:
             with self.data_file.open("a", encoding="utf-8") as data:
@@ -75,14 +111,39 @@ class StorageNode:
                 data.flush()
                 os.fsync(data.fileno())
 
-        self.messages[message["id"]] = message
-        self.log.append(message)
+        if existing is None:
+            self.messages[message["id"]] = message
+            self.log.append(message)
+        else:
+            existing.update(message)
         return True
 
     def add_message(self, message):
         self._validate_message(message)
+        message = {key: message[key] for key in ("id", "from", "to", "subject", "body")}
         with self.lock:
             return self._apply_message(message)
+
+    def set_read(self, user, message_id, read):
+        with self.lock:
+            message = self.messages.get(message_id)
+            if message is None or message["deleted"] or message["to"] != user:
+                return None
+            rv = max(int(time.time() * 1000), message["rv"] + 1)
+            self._apply_message(dict(message, read=read, rv=rv))
+            return dict(message)
+
+    def delete_message(self, user, message_id):
+        with self.lock:
+            message = self.messages.get(message_id)
+            if message is not None and (message["deleted"] or message["to"] != user):
+                return False
+            tombstone = dict(message) if message is not None else {
+                "id": message_id, "to": user, "from": "", "subject": "", "body": "",
+            }
+            tombstone["deleted"] = True
+            self._apply_message(tombstone)
+            return message is not None
 
     def import_messages(self, messages):
         if not isinstance(messages, list):
@@ -96,12 +157,15 @@ class StorageNode:
 
     def mailbox(self, user):
         with self.lock:
-            return [dict(message) for message in self.log if message["to"] == user]
+            return [
+                dict(message) for message in self.log
+                if message["to"] == user and not message["deleted"]
+            ]
 
     def get_message(self, user, message_id):
         with self.lock:
             message = self.messages.get(message_id)
-            if message is None or message["to"] != user:
+            if message is None or message["deleted"] or message["to"] != user:
                 return None
             return dict(message)
 
@@ -139,6 +203,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_error(self, code, message=None, explain=None):
+        self.send(code, {"error": message or self.responses.get(code, ("error",))[0]})
+
     def body(self):
         try:
             length = int(self.headers.get("Content-Length", ""))
@@ -174,6 +241,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self.send(200, {
                 "messages": len(self.node.all_messages()),
                 "peer": self.peer_url or None,
+                "peer_reachable": self.node.peer_reachable,
             })
         if parsed.path == "/replication":
             return self.send(200, {"messages": self.node.all_messages()})
@@ -203,6 +271,33 @@ class RequestHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             return self.send(400, {"error": str(error)})
 
+    def do_PUT(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        try:
+            body = self.body()
+            mailbox = self._mailbox_path(parsed.path)
+            if mailbox is None or mailbox[1] is None:
+                return self.send(404, {"error": "unknown path"})
+            if not isinstance(body.get("read"), bool):
+                raise ValueError('body must contain "read": true or "read": false')
+            user, message_id = mailbox
+            message = self.node.set_read(user, message_id, body["read"])
+            if message is None:
+                return self.send(404, {"error": "no such message", "id": message_id})
+            return self.send(200, {key: message[key] for key in ("id", "from", "subject", "read")})
+        except ValueError as error:
+            return self.send(400, {"error": str(error)})
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        mailbox = self._mailbox_path(parsed.path)
+        if mailbox is None or mailbox[1] is None:
+            return self.send(404, {"error": "unknown path"})
+        user, message_id = mailbox
+        if not self.node.delete_message(user, message_id):
+            return self.send(404, {"error": "no such message", "id": message_id})
+        return self.send(200, {"id": message_id, "deleted": True})
+
 
 def peer_address(value, default_port):
     if not value:
@@ -219,7 +314,9 @@ def sync_peer(node, peer_url, interval, stop_event):
         try:
             result = http_get(f"{peer_url}/replication")
             node.import_messages(result.get("messages"))
+            node.peer_reachable = True
         except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as error:
+            node.peer_reachable = False
             print(f"peer sync with {peer_url} failed: {error}", flush=True)
         stop_event.wait(interval)
 
