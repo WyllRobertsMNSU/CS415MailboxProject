@@ -2,7 +2,7 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request, urllib.error
-
+from routing import get_home_site, forward_request 
 def storage_get(url):
     with urllib.request.urlopen(url, timeout=2) as response:
         return json.loads(response.read())
@@ -36,6 +36,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
         
         user = parts[2]
 
+        #find the site that stores the users mailbox 
+        home_site = get_home_site(user)
+        #send request to the correct site if it isnt ours 
+        if home_site != self.server.site:
+            status, response = forward_request(
+                home_site, "GET", self.path
+            )
+            return self.send_json(status, response)
+
         try:
             url = self.server.storage2 + self.path
             messages = storage_get(url)
@@ -68,7 +77,8 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--site", default="node-1")
+    # each group member must use thier own site number(site-1, site-2, site-3, site-4)
+    parser.add_argument("--site", default="site-4")
     parser.add_argument("--sites", default="sites.json")
     parser.add_argument(
         "--storage2",
