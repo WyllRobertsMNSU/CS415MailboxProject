@@ -1,5 +1,6 @@
 
 import hashlib
+import http.client
 import json
 import urllib.request
 import urllib.error
@@ -18,7 +19,7 @@ SITES = {
 
 
 # Prevent requests from waiting too long
-TIMEOUT = 2.0
+TIMEOUT = 3.0
 
 
 def get_home_site(username):
@@ -44,6 +45,17 @@ def get_replica_site(username):
     replica_index = (home_index + 1) % len(site_names)
 
     return site_names[replica_index]
+
+def get_replica_peers(site):
+    site_names = sorted(SITES)
+
+    index = site_names.index(site)
+
+    return sorted({
+        site_names[(index - 1) % len(site_names)],
+        site_names[(index + 1) % len(site_names)]
+    })
+
 def forward_request(site, method, path, body=None):
     url = SITES[site] + path
 
@@ -69,12 +81,18 @@ def forward_request(site, method, path, body=None):
             )
 
     except urllib.error.HTTPError as error:
-        return (
-            error.code,
-            json.loads(error.read())
-        )
+        try:
+            return (
+                error.code,
+                json.loads(error.read())
+            )
+        except ValueError:
+            return (
+                error.code,
+                {"error": "unexpected reply from site", "site": site}
+            )
 
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError):
         return (
             503,
             {
@@ -85,7 +103,7 @@ def forward_request(site, method, path, body=None):
 
 
 def check_site(site):
-    url = SITES[site] + "/status"
+    url = SITES[site] + "/status?brief=1"
 
     try:
         with urllib.request.urlopen(
